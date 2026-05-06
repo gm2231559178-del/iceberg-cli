@@ -123,7 +123,7 @@ pub(crate) fn detect_cycles(jobs: &[SyncJob]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{IcebergPartitionConfig, MergeConfig, SyncMode, WriteMode};
+    use crate::config::{IcebergPartitionConfig, MergeConfig, ReadIsolation, SyncMode, WriteMode};
 
     fn stub_job(name: &str, write_mode: WriteMode) -> SyncJob {
         use crate::config::{CursorType, WatermarkType};
@@ -148,6 +148,7 @@ mod tests {
             group: None,
             watermark_column: None,
             watermark_type: WatermarkType::Timestamptz,
+            read_isolation: ReadIsolation::RepeatableRead,
         }
     }
 

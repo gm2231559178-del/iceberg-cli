@@ -75,6 +75,7 @@ mod tests {
             partition_column: None,
             iceberg_partition: None,
             merge: None,
+            read_isolation: crate::config::ReadIsolation::RepeatableRead,
             schema_evolution: Default::default(),
             depends_on: None,
             retry: None,

@@ -388,6 +388,15 @@ pub struct SyncJob {
 
     /// Merge config for `write_mode: upsert` and `write_mode: merge_into`.
     pub merge: Option<MergeConfig>,
+
+    /// PostgreSQL isolation level for the read phase.
+    ///
+    /// Defaults to `repeatable_read`, which wraps all page queries in a single
+    /// `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` transaction so every
+    /// batch sees the same consistent snapshot.  Set to `none` only for sources
+    /// that do not support `REPEATABLE READ` (e.g. some foreign-data wrappers).
+    #[serde(default)]
+    pub read_isolation: ReadIsolation,
 }
 
 fn default_batch_size() -> usize {
@@ -426,6 +435,27 @@ pub enum CursorType {
     #[default]
     Int,
     Text,
+}
+
+// ── Read isolation ────────────────────────────────────────────────────────────
+
+/// Controls the PostgreSQL isolation level used for the read phase of a sync job.
+///
+/// All page queries within a single job run execute inside one transaction at
+/// this level, giving a consistent snapshot across batches.
+///
+/// - `repeatable_read` (default) — `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`
+///   Freezes the source view at job-start time.  Prevents phantom rows from
+///   cursor-column updates shifting pages, and offset drift from concurrent deletes.
+///   Safe on replicas; zero write overhead on primary.
+/// - `none` — no explicit transaction.  Use only for foreign-data wrappers or
+///   exotic sources that do not support `REPEATABLE READ`.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadIsolation {
+    #[default]
+    RepeatableRead,
+    None,
 }
 
 // ── RabbitMQ ──────────────────────────────────────────────────────────────────

@@ -42,7 +42,44 @@ pub async fn connect(dsn: &str) -> Result<Client> {
     Ok(client)
 }
 
-// ── SQL parameter substitution ────────────────────────────────────────────────
+// ── Read-phase transaction helpers ────────────────────────────────────────────
+
+/// Open a `REPEATABLE READ READ ONLY` transaction on `client`.
+///
+/// All page queries issued within a sync job run execute inside this
+/// transaction, giving a consistent snapshot across batches.  `READ ONLY`
+/// tells Postgres no writes will follow, enabling use on hot-standby replicas
+/// and skipping predicate-lock overhead on the primary.
+///
+/// Call [`commit_read_txn`] on success or [`rollback_read_txn`] on error.
+pub async fn begin_repeatable_read(client: &Client) -> Result<()> {
+    client
+        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await
+        .context("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+}
+
+/// Commit the read-only transaction opened by [`begin_repeatable_read`].
+///
+/// For a `READ ONLY` transaction this is semantically a no-op for data, but
+/// it releases the snapshot slot on the server immediately rather than waiting
+/// for the connection to close.
+pub async fn commit_read_txn(client: &Client) -> Result<()> {
+    client
+        .batch_execute("COMMIT")
+        .await
+        .context("COMMIT read transaction")
+}
+
+/// Roll back the read-only transaction opened by [`begin_repeatable_read`].
+///
+/// Best-effort: errors are logged but not propagated, because the connection
+/// is typically dropped immediately after an error path anyway.
+pub async fn rollback_read_txn(client: &Client) {
+    if let Err(e) = client.batch_execute("ROLLBACK").await {
+        tracing::warn!(error = %e, "ROLLBACK of read transaction failed (connection may already be closed)");
+    }
+}
 
 /// Substitutes named `:placeholder` markers with `$1`, `$2`, … in order of
 /// first appearance.  Skips `::` (PostgreSQL cast syntax).

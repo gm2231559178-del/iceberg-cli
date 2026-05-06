@@ -59,6 +59,7 @@ use tracing::{info, warn};
 use crate::config::{
     // IcebergPartitionConfig,
     CursorType,
+    ReadIsolation,
     RetryConfig,
     SchemaEvolutionConfig,
     SyncJob,
@@ -70,8 +71,8 @@ use crate::sync::{
     // file_name::ProductionFileNameGenerator,
     metadata::{RunSummary, build_metadata_updates, read_watermark},
     postgres::{
-        SqlValue, connect as pg_connect, max_int_in_batch, max_text_in_batch,
-        max_timestamp_in_batch, query_to_batch,
+        SqlValue, begin_repeatable_read, commit_read_txn, connect as pg_connect, max_int_in_batch,
+        max_text_in_batch, max_timestamp_in_batch, query_to_batch, rollback_read_txn,
     },
     write_strategies::{
         apply_plan_to_transaction, plan_append, plan_merge_into, plan_overwrite, plan_upsert,
@@ -206,8 +207,58 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         };
         params.insert("watermark".to_string(), wm_sql_val);
 
-        // ── 3. Fetch & write in batches ───────────────────────────────────────
-        let mut total_rows: usize = 0;
+        // ── 3. Open a consistent read snapshot ───────────────────────────────
+        // All page queries run inside one REPEATABLE READ READ ONLY transaction
+        // so every batch sees the same logical instant.  This prevents:
+        //   • phantom rows  — cursor-column updates shifting a row between pages
+        //   • offset drift  — concurrent deletes moving subsequent OFFSET pages
+        //   • watermark gap — rows inserted with ts ≤ watermark after loop start
+        //
+        // READ ONLY allows use on hot-standby replicas and skips predicate-lock
+        // overhead on the primary.  Commit/rollback releases the snapshot slot.
+        if job.read_isolation == ReadIsolation::RepeatableRead {
+            begin_repeatable_read(&pg)
+                .await
+                .context("Failed to open REPEATABLE READ snapshot for read phase")?;
+        }
+
+        // ── 4. Fetch & write in batches ───────────────────────────────────────
+        //
+        // Run the loop inside a local closure result so we can explicitly
+        // rollback the read transaction on any error before propagating it.
+        let loop_result = self.run_batch_loop(job, &pg, watermark, params).await;
+
+        // ── 5. Close the consistent read snapshot ────────────────────────────
+        match &loop_result {
+            Ok(_) => {
+                // COMMIT is a no-op for READ ONLY but releases the snapshot slot.
+                if job.read_isolation == ReadIsolation::RepeatableRead {
+                    commit_read_txn(&pg)
+                        .await
+                        .context("Failed to COMMIT read transaction after batch loop")?;
+                }
+            }
+            Err(_) => {
+                // Best-effort rollback; the connection drop would also roll back,
+                // but being explicit avoids leaving the slot open during retry delay.
+                if job.read_isolation == ReadIsolation::RepeatableRead {
+                    rollback_read_txn(&pg).await;
+                }
+            }
+        }
+
+        loop_result
+    }
+
+    // ── Batch loop ────────────────────────────────────────────────────────────
+
+    async fn run_batch_loop(
+        &self,
+        job: &SyncJob,
+        pg: &tokio_postgres::Client,
+        watermark: Option<DateTime<Utc>>,
+        mut params: HashMap<String, SqlValue>,
+    ) -> Result<RunSummary> {
         let mut new_watermark: Option<DateTime<Utc>> = watermark;
 
         let mut cursor_value: i64 = i64::MIN;
@@ -218,6 +269,7 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
         // once per job run rather than on every batch iteration.
         let mut table_ready = false;
         let mut schema_checked = false;
+        let mut total_rows: usize = 0;
 
         loop {
             if job.cursor_column.is_some() {
@@ -240,7 +292,7 @@ impl<'a, C: Catalog> SyncEngine<'a, C> {
             }
 
             let paged_sql = build_paged_sql(job, offset);
-            let batch = query_to_batch(&pg, &paged_sql, &params)
+            let batch = query_to_batch(pg, &paged_sql, &params)
                 .await
                 .with_context(|| format!("Failed to fetch batch at offset {}", offset))?;
 
@@ -844,6 +896,7 @@ mod tests {
             partition_column: None,
             iceberg_partition: None,
             merge: None,
+            read_isolation: crate::config::ReadIsolation::RepeatableRead,
         }
     }
 }
