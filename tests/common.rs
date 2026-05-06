@@ -12,7 +12,7 @@ use std::time::Duration;
 
 pub fn cli_bin() -> String {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
-    format!("{manifest}/target/release/iceberg-cli")
+    format!("{manifest}/target/debug/iceberg-cli")
 }
 
 pub fn iceberg_uri() -> String {
@@ -125,7 +125,7 @@ pub fn with_sync_config<F: FnOnce(&str)>(yaml: &str, f: F) {
 pub fn preflight() {
     assert!(
         std::path::Path::new(&cli_bin()).exists(),
-        "CLI binary not found at {}. Run: cargo build --release",
+        "CLI binary not found at {}. Run: cargo build",
         cli_bin()
     );
     wait_for_http(
