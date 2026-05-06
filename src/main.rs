@@ -846,6 +846,17 @@ async fn cmd_drop_table(catalog: &impl Catalog, table_str: &str, purge: bool) ->
     Ok(())
 }
 
+/// Resolve a metadata file path that may be stored as an absolute URI or as a
+/// path relative to the table's root location.
+fn resolve_metadata_path(table_location: &str, path: &str) -> String {
+    // Absolute URIs (s3://, s3a://, file://, gs://, abfs://, etc.) are used as-is.
+    if path.contains("://") || path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("{}/{}", table_location.trim_end_matches('/'), path)
+    }
+}
+
 /// Walk every snapshot's manifest chain and delete all referenced data files,
 /// manifest files, and manifest list files via FileIO.
 ///
@@ -918,23 +929,25 @@ async fn purge_table_files(table: &iceberg::table::Table, table_str: &str) -> Re
     }
 
     // ── Collect metadata JSON files from version history ──────────────────────
-    // The metadata log tracks every metadata.json the table has ever written.
+    // metadata_log() contains every *previous* metadata.json the table has
+    // written. Paths may be absolute (s3://…) or relative to the table
+    // location depending on the catalog implementation, so we resolve them.
     let mut metadata_files: HashSet<String> = HashSet::new();
-    for log_entry in meta.history() {
-        // history() returns SnapshotLog entries — the metadata JSON paths are
-        // stored in metadata_log() separately.
-        let _ = log_entry; // snapshot log, not metadata log
-    }
-    // metadata_log() gives us the actual metadata.json version history.
     for meta_entry in meta.metadata_log() {
-        metadata_files.insert(meta_entry.metadata_file.clone());
+        let path = resolve_metadata_path(meta.location(), &meta_entry.metadata_file);
+        metadata_files.insert(path);
     }
-    // Always include the current metadata file.
-    if let Some(current_meta_path) = meta.location().strip_suffix('/') {
-        // The REST catalog stores current metadata under metadata/v<N>.metadata.json;
-        // we can't always know the exact name without the catalog, so we rely on
-        // metadata_log() above and warn if it was empty.
-        let _ = current_meta_path;
+    // The *current* metadata file is never present in metadata_log() — it is
+    // only added to the log when a newer version supersedes it.  Retrieve it
+    // directly from the Table struct (populated by the catalog on load).
+    if let Some(current) = table.metadata_location() {
+        metadata_files.insert(current.to_string());
+    } else {
+        tracing::warn!(
+            table = table_str,
+            "Could not determine current metadata file location; \
+             it may not be deleted. Consider cleaning manually."
+        );
     }
 
     let total_data = data_files.len();
