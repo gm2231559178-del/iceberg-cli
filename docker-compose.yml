@@ -1,28 +1,36 @@
 services:
-  # ── Spark ────────────────────────────────────────────────────
+  # ── Spark + HiveServer2 ───────────────────────────────────────────────────────
   spark-iceberg:
     image: tabulario/spark-iceberg
     container_name: spark-iceberg
-    build: spark/
     networks:
       iceberg_net:
     depends_on:
-      - rest
-      - minio
+      rest:
+        condition: service_started
+      minio:
+        condition: service_healthy
     volumes:
       - ./warehouse:/home/iceberg/warehouse
       - ./notebooks:/home/iceberg/notebooks/notebooks
+      # - ./spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
     environment:
       - AWS_ACCESS_KEY_ID=admin
       - AWS_SECRET_ACCESS_KEY=password
       - AWS_REGION=us-east-1
     ports:
-      - 8888:8888
-      - 8080:8080
-      - 10000:10000
-      - 10001:10001
+      - "8888:8888" # Jupyter
+      - "8080:8080" # Spark UI
+      - "10000:10000" # HiveServer2 (Thrift / JDBC)
+      - "10001:10001" # HiveServer2 HTTP transport
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 10000 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
 
-  # ── Iceberg REST catalog ─────────────────────────────────────────────────────
+  # ── Iceberg REST catalog ──────────────────────────────────────────────────────
   rest:
     image: apache/iceberg-rest-fixture
     container_name: iceberg-rest
@@ -41,7 +49,7 @@ services:
       mc:
         condition: service_started
 
-  # ── MinIO object store ───────────────────────────────────────────────────────
+  # ── MinIO object store ────────────────────────────────────────────────────────
   minio:
     image: minio/minio
     container_name: minio
@@ -63,7 +71,7 @@ services:
       timeout: 5s
       retries: 10
 
-  # ── MinIO bucket bootstrap ───────────────────────────────────────────────────
+  # ── MinIO bucket bootstrap ────────────────────────────────────────────────────
   mc:
     image: minio/mc
     container_name: mc
@@ -86,7 +94,7 @@ services:
       tail -f /dev/null
       "
 
-  # ── PostgreSQL source database ───────────────────────────────────────────────
+  # ── PostgreSQL source database ────────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
     container_name: iceberg-postgres
@@ -107,7 +115,7 @@ services:
       timeout: 5s
       retries: 10
 
-  # ── RabbitMQ message broker ──────────────────────────────────────────────────
+  # ── RabbitMQ message broker ───────────────────────────────────────────────────
   rabbitmq:
     image: rabbitmq:3.13-management-alpine
     container_name: iceberg-rabbitmq
@@ -125,11 +133,7 @@ services:
       timeout: 10s
       retries: 15
 
-  # ── Iceberg data initialiser ─────────────────────────────────────────────────
-  # Runs once to seed Iceberg with example data from PostgreSQL.
-  # Switch between two modes in sync-init.yaml:
-  #   Option A (default) – sync the real tables from postgres/init.sql
-  #   Option B           – generate 10 000 synthetic user rows via SQL
+  # ── Iceberg data initialiser ──────────────────────────────────────────────────
   iceberg-init:
     image: ghcr.io/jyasuu/iceberg-cli:main
     container_name: iceberg-init
@@ -165,7 +169,6 @@ services:
         echo "==> Scanning demo.order_items"
         $$CLI scan --table demo.order_items
 
-        # Option B: uncomment if using generated data instead
         echo ""
         echo "==> Scanning demo.users_generated"
         $$CLI scan --table demo.users_generated
@@ -177,6 +180,49 @@ services:
       - AWS_ACCESS_KEY_ID=admin
       - AWS_SECRET_ACCESS_KEY=password
       - AWS_REGION=us-east-1
+
+  # ── Spark SQL demo runner (runs after iceberg-init) ───────────────────────────
+  # Executes spark/demo.sql end-to-end then exits.
+  # To run interactively instead, see README / run-demo.sh.
+  spark-sql-demo:
+    image: tabulario/spark-iceberg
+    container_name: spark-sql-demo
+    networks:
+      iceberg_net:
+    depends_on:
+      # spark-iceberg:
+      #   condition: service_healthy
+      iceberg-init:
+        condition: service_completed_successfully
+    volumes:
+      # - ./spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./spark/demo.sql:/home/iceberg/demo.sql:ro
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "==> Running Iceberg MERGE demo via spark-sql..."
+        /opt/spark/bin/spark-sql \
+          --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+          --conf spark.sql.catalog.core=org.apache.iceberg.spark.SparkCatalog \
+          --conf spark.sql.catalog.core.type=rest \
+          --conf spark.sql.catalog.core.uri=http://rest:8181 \
+          --conf spark.sql.catalog.core.io-impl=org.apache.iceberg.aws.s3.S3FileIO \
+          --conf spark.sql.catalog.core.default-namespace=core \
+          --conf spark.sql.catalog.core.s3.endpoint=http://minio:9000 \
+          --conf spark.sql.catalog.core.warehouse=s3a://warehouse/ \
+          --conf spark.sql.catalog.spark_catalog=org.apache.iceberg.spark.SparkSessionCatalog \
+          --conf spark.sql.catalog.spark_catalog.type=hive \
+          --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
+          --conf spark.hadoop.fs.s3a.access.key=admin \
+          --conf spark.hadoop.fs.s3a.secret.key=password \
+          --conf spark.hadoop.fs.s3a.path.style.access=true \
+          -f /home/iceberg/demo.sql
+        echo "==> Demo complete."
+    restart: "no"
 
 networks:
   iceberg_net:
