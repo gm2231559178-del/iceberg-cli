@@ -30,6 +30,43 @@
 //!   iceberg-cli --uri http://localhost:8181 create-table \
 //!       --table my_db.products \
 //!       --schema "id:long,name:string,price:double"
+//!
+//!   # ── Data file inspection (like Spark's SELECT * FROM table$files) ───────
+//!
+//!   # List data files in the current snapshot
+//!   iceberg-cli --uri http://localhost:8181 files --table my_db.events
+//!
+//!   # Include deleted files and per-column stats
+//!   iceberg-cli --uri http://localhost:8181 files --table my_db.events \
+//!       --all-status --column-stats --bounds
+//!
+//!   # ── Metadata / properties ─────────────────────────────────────────────
+//!
+//!   # Show table properties (read-only)
+//!   iceberg-cli --uri http://localhost:8181 table-properties --table my_db.products
+//!
+//!   # Set / remove table properties
+//!   iceberg-cli --uri http://localhost:8181 table-properties --table my_db.products \
+//!       --set write.parquet.compression-codec=zstd \
+//!       --remove write.target-file-size-bytes
+//!
+//!   # Show partition spec (add --all to see historical specs)
+//!   iceberg-cli --uri http://localhost:8181 partition-spec --table my_db.events
+//!   iceberg-cli --uri http://localhost:8181 partition-spec --table my_db.events --all
+//!
+//!   # Show sort order
+//!   iceberg-cli --uri http://localhost:8181 sort-order --table my_db.products
+//!
+//!   # Show full schema evolution history
+//!   iceberg-cli --uri http://localhost:8181 schema-history --table my_db.products
+//!
+//!   # Show full detail for a snapshot (default: current; pass --snapshot-id for any)
+//!   iceberg-cli --uri http://localhost:8181 snapshot-detail --table my_db.products
+//!   iceberg-cli --uri http://localhost:8181 snapshot-detail --table my_db.products \
+//!       --snapshot-id 1234567890
+//!
+//!   # Show metadata-file version log
+//!   iceberg-cli --uri http://localhost:8181 metadata-log --table my_db.products
 
 mod cmd;
 mod config;
@@ -51,7 +88,10 @@ use futures::TryStreamExt;
 use iceberg::{
     Catalog, CatalogBuilder, TableCreation,
     spec::{
+        DataContentType,
         DataFileFormat,
+        Datum,
+        ManifestStatus,
         PartitionKey,
         // PartitionSpec,
         PrimitiveType,
@@ -341,6 +381,84 @@ enum Commands {
         #[arg(long)]
         limit: Option<usize>,
     },
+
+    /// List data files tracked in the current snapshot (like SELECT * FROM <table>$files)
+    Files {
+        /// Fully-qualified table: namespace.table
+        #[arg(long)]
+        table: String,
+
+        /// Show deleted / EXISTING files too (not just ADDED ones)
+        #[arg(long, default_value_t = false)]
+        all_status: bool,
+
+        /// Filter to a specific snapshot (default: current)
+        #[arg(long)]
+        snapshot_id: Option<i64>,
+
+        /// Show per-column stats (column_sizes, value_counts, null_value_counts)
+        #[arg(long, default_value_t = false)]
+        column_stats: bool,
+
+        /// Show lower/upper bounds per column
+        #[arg(long, default_value_t = false)]
+        bounds: bool,
+    },
+
+    // ── Metadata / properties commands ───────────────────────────────────────
+    /// Show, set, or remove table-level properties
+    TableProperties {
+        /// Fully-qualified table: namespace.table
+        #[arg(long)]
+        table: String,
+        /// Set a property as "key=value" (can be repeated)
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        /// Remove a property key (can be repeated)
+        #[arg(long = "remove", value_name = "KEY")]
+        remove: Vec<String>,
+    },
+
+    /// Show the partition spec for a table
+    PartitionSpec {
+        /// Fully-qualified table: namespace.table
+        #[arg(long)]
+        table: String,
+        /// Show all historical partition specs, not just the current one
+        #[arg(long, default_value_t = false)]
+        all: bool,
+    },
+
+    /// Show the sort order(s) for a table
+    SortOrder {
+        /// Fully-qualified table: namespace.table
+        #[arg(long)]
+        table: String,
+    },
+
+    /// List all historical schema versions for a table
+    SchemaHistory {
+        /// Fully-qualified table: namespace.table
+        #[arg(long)]
+        table: String,
+    },
+
+    /// Show full details of a single snapshot
+    SnapshotDetail {
+        /// Fully-qualified table: namespace.table
+        #[arg(long)]
+        table: String,
+        /// Snapshot ID to inspect (default: current snapshot)
+        #[arg(long)]
+        snapshot_id: Option<i64>,
+    },
+
+    /// Show the metadata-file version history for a table
+    MetadataLog {
+        /// Fully-qualified table: namespace.table
+        #[arg(long)]
+        table: String,
+    },
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -439,6 +557,33 @@ async fn main() -> Result<()> {
         Commands::CopyTable { from, to, limit } => {
             cmd_copy_table(&catalog, from, to, *limit).await?
         }
+        Commands::Files {
+            table,
+            all_status,
+            snapshot_id,
+            column_stats,
+            bounds,
+        } => {
+            cmd_files(
+                &catalog,
+                table,
+                *all_status,
+                *snapshot_id,
+                *column_stats,
+                *bounds,
+            )
+            .await?
+        }
+        Commands::TableProperties { table, set, remove } => {
+            cmd_table_properties(&catalog, table, set, remove).await?
+        }
+        Commands::PartitionSpec { table, all } => cmd_partition_spec(&catalog, table, *all).await?,
+        Commands::SortOrder { table } => cmd_sort_order(&catalog, table).await?,
+        Commands::SchemaHistory { table } => cmd_schema_history(&catalog, table).await?,
+        Commands::SnapshotDetail { table, snapshot_id } => {
+            cmd_snapshot_detail(&catalog, table, *snapshot_id).await?
+        }
+        Commands::MetadataLog { table } => cmd_metadata_log(&catalog, table).await?,
         Commands::Sync {
             config,
             job,
@@ -1933,4 +2078,518 @@ async fn cmd_sync_consume(catalog: impl Catalog + 'static, config_path: &str) ->
     println!("Starting RabbitMQ consumer loop.  Press Ctrl-C to stop.");
     sync::rabbitmq::run_consumers(rmq, Arc::clone(&cfg), Arc::new(catalog)).await?;
     Ok(())
+}
+
+// ─── table-properties ────────────────────────────────────────────────────────
+
+async fn cmd_table_properties(
+    catalog: &impl Catalog,
+    table_str: &str,
+    set: &[String],
+    remove: &[String],
+) -> Result<()> {
+    let ident = parse_table(table_str)?;
+
+    if set.is_empty() && remove.is_empty() {
+        // Read-only mode: display current properties
+        let table = catalog
+            .load_table(&ident)
+            .await
+            .with_context(|| format!("load_table({table_str})"))?;
+        let props = table.metadata().properties();
+        if props.is_empty() {
+            println!("(no properties on table '{table_str}')");
+        } else {
+            let mut tbl = Table::new();
+            tbl.load_preset(UTF8_FULL).set_header(vec!["Key", "Value"]);
+            let mut pairs: Vec<_> = props.iter().collect();
+            pairs.sort_by_key(|(k, _)| k.as_str());
+            for (k, v) in pairs {
+                tbl.add_row(vec![k, v]);
+            }
+            println!("{tbl}");
+        }
+        return Ok(());
+    }
+
+    // Mutate mode: fetch → merge → POST via REST update-table
+    let table = catalog
+        .load_table(&ident)
+        .await
+        .with_context(|| format!("load_table({table_str})"))?;
+
+    let mut current: HashMap<String, String> = table
+        .metadata()
+        .properties()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    for key in remove {
+        current.remove(key.as_str());
+    }
+    for kv in set {
+        let parts: Vec<&str> = kv.splitn(2, '=').collect();
+        if parts.len() != 2 {
+            anyhow::bail!("Expected 'key=value', got '{kv}'");
+        }
+        current.insert(parts[0].to_string(), parts[1].to_string());
+    }
+
+    let uri = std::env::var("ICEBERG_URI").unwrap_or_else(|_| "http://localhost:8181".to_string());
+    let ns = ident.namespace().to_url_string();
+    let tbl_name = ident.name();
+    let url = format!("{uri}/v1/namespaces/{ns}/tables/{tbl_name}");
+    let current_schema_id = table.metadata().current_schema().schema_id();
+    let body = serde_json::json!({
+        "identifier": { "namespace": ns.as_str(), "name": tbl_name },
+        "requirements": [{ "type": "assert-current-schema-id", "current-schema-id": current_schema_id }],
+        "updates": [
+            { "action": "set-properties", "updates": current }
+        ]
+    });
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .context("POST update-table (set-properties)")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Catalog returned {status}: {text}");
+    }
+    println!("Updated properties for table '{table_str}'.");
+    Ok(())
+}
+
+// ─── partition-spec ───────────────────────────────────────────────────────────
+
+async fn cmd_partition_spec(catalog: &impl Catalog, table_str: &str, show_all: bool) -> Result<()> {
+    let ident = parse_table(table_str)?;
+    let table = catalog
+        .load_table(&ident)
+        .await
+        .with_context(|| format!("load_table({table_str})"))?;
+    let meta = table.metadata();
+    let schema = meta.current_schema();
+    let current_spec_id = meta.default_partition_spec().spec_id();
+
+    let specs: Vec<_> = if show_all {
+        meta.partition_specs_iter().collect()
+    } else {
+        vec![meta.default_partition_spec()]
+    };
+
+    for spec in specs {
+        let marker = if spec.spec_id() == current_spec_id {
+            " (current)"
+        } else {
+            ""
+        };
+        println!("━━━  Partition Spec ID: {}{marker}  ━━━", spec.spec_id());
+        if spec.is_unpartitioned() {
+            println!("  (unpartitioned)");
+            continue;
+        }
+        let mut tbl = Table::new();
+        tbl.load_preset(UTF8_FULL).set_header(vec![
+            "Field ID",
+            "Name",
+            "Source Column",
+            "Transform",
+        ]);
+        for field in spec.fields() {
+            let source_name = schema
+                .field_by_id(field.source_id)
+                .map(|f| f.name.as_str())
+                .unwrap_or("?");
+            tbl.add_row(vec![
+                field.field_id.to_string(),
+                field.name.clone(),
+                source_name.to_string(),
+                format!("{}", field.transform),
+            ]);
+        }
+        println!("{tbl}");
+    }
+    Ok(())
+}
+
+// ─── sort-order ───────────────────────────────────────────────────────────────
+
+async fn cmd_sort_order(catalog: &impl Catalog, table_str: &str) -> Result<()> {
+    let ident = parse_table(table_str)?;
+    let table = catalog
+        .load_table(&ident)
+        .await
+        .with_context(|| format!("load_table({table_str})"))?;
+    let meta = table.metadata();
+    let schema = meta.current_schema();
+    let default_id = meta.default_sort_order().order_id;
+
+    let orders: Vec<_> = meta.sort_orders_iter().collect();
+
+    if orders.is_empty() {
+        println!("(no sort orders defined for '{table_str}')");
+        return Ok(());
+    }
+
+    for order in orders {
+        let marker = if order.order_id == default_id {
+            " (default)"
+        } else {
+            ""
+        };
+        println!("━━━  Sort Order ID: {}{marker}  ━━━", order.order_id);
+        if order.is_unsorted() {
+            println!("  (unsorted)");
+            continue;
+        }
+        let mut tbl = Table::new();
+        tbl.load_preset(UTF8_FULL).set_header(vec![
+            "Column",
+            "Transform",
+            "Direction",
+            "Null Order",
+        ]);
+        for field in &order.fields {
+            let col_name = schema
+                .field_by_id(field.source_id)
+                .map(|f| f.name.as_str())
+                .unwrap_or("?");
+            let direction = match field.direction {
+                iceberg::spec::SortDirection::Ascending => "ASC",
+                iceberg::spec::SortDirection::Descending => "DESC",
+            };
+            let null_order = match field.null_order {
+                iceberg::spec::NullOrder::First => "NULLS FIRST",
+                iceberg::spec::NullOrder::Last => "NULLS LAST",
+            };
+            tbl.add_row(vec![
+                col_name.to_string(),
+                format!("{}", field.transform),
+                direction.to_string(),
+                null_order.to_string(),
+            ]);
+        }
+        println!("{tbl}");
+    }
+    Ok(())
+}
+
+// ─── schema-history ───────────────────────────────────────────────────────────
+
+async fn cmd_schema_history(catalog: &impl Catalog, table_str: &str) -> Result<()> {
+    let ident = parse_table(table_str)?;
+    let table = catalog
+        .load_table(&ident)
+        .await
+        .with_context(|| format!("load_table({table_str})"))?;
+    let meta = table.metadata();
+    let current_id = meta.current_schema().schema_id();
+
+    let schemas: Vec<_> = meta.schemas_iter().collect();
+
+    println!("━━━  Schema History: {table_str}  ━━━");
+    println!("  {} schema version(s) total\n", schemas.len());
+
+    for schema in schemas {
+        let marker = if schema.schema_id() == current_id {
+            " ◀ current"
+        } else {
+            ""
+        };
+        println!("── Schema ID: {}{marker} ──", schema.schema_id());
+        let mut tbl = Table::new();
+        tbl.load_preset(UTF8_FULL)
+            .set_header(vec!["Field ID", "Name", "Type", "Required"]);
+        for field in schema.as_struct().fields() {
+            tbl.add_row(vec![
+                field.id.to_string(),
+                field.name.clone(),
+                format!("{:?}", field.field_type),
+                field.required.to_string(),
+            ]);
+        }
+        println!("{tbl}\n");
+    }
+    Ok(())
+}
+
+// ─── snapshot-detail ─────────────────────────────────────────────────────────
+
+async fn cmd_snapshot_detail(
+    catalog: &impl Catalog,
+    table_str: &str,
+    snapshot_id: Option<i64>,
+) -> Result<()> {
+    let ident = parse_table(table_str)?;
+    let table = catalog
+        .load_table(&ident)
+        .await
+        .with_context(|| format!("load_table({table_str})"))?;
+    let meta = table.metadata();
+
+    let snap = match snapshot_id {
+        Some(id) => meta
+            .snapshot_by_id(id)
+            .ok_or_else(|| anyhow::anyhow!("Snapshot {id} not found in '{table_str}'"))?,
+        None => meta
+            .current_snapshot()
+            .ok_or_else(|| anyhow::anyhow!("Table '{table_str}' has no current snapshot"))?,
+    };
+
+    let current_id = meta.current_snapshot().map(|s| s.snapshot_id());
+    let is_current = current_id == Some(snap.snapshot_id());
+
+    let ts = chrono::DateTime::from_timestamp_millis(snap.timestamp_ms())
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| snap.timestamp_ms().to_string());
+
+    println!("━━━  Snapshot Detail: {table_str}  ━━━");
+    println!("  Snapshot ID    : {}", snap.snapshot_id());
+    println!("  Timestamp      : {ts}");
+    println!("  Operation      : {:?}", snap.summary().operation);
+    println!("  Current        : {is_current}");
+    if let Some(parent) = snap.parent_snapshot_id() {
+        println!("  Parent ID      : {parent}");
+    }
+    println!("  Manifest list  : {}", snap.manifest_list());
+
+    let props = &snap.summary().additional_properties;
+    if !props.is_empty() {
+        println!("\nSummary Properties:");
+        let mut tbl = Table::new();
+        tbl.load_preset(UTF8_FULL).set_header(vec!["Key", "Value"]);
+        let mut pairs: Vec<_> = props.iter().collect();
+        pairs.sort_by_key(|(k, _)| k.as_str());
+        for (k, v) in pairs {
+            tbl.add_row(vec![k, v]);
+        }
+        println!("{tbl}");
+    }
+    Ok(())
+}
+
+// ─── metadata-log ────────────────────────────────────────────────────────────
+
+async fn cmd_metadata_log(catalog: &impl Catalog, table_str: &str) -> Result<()> {
+    let ident = parse_table(table_str)?;
+    let table = catalog
+        .load_table(&ident)
+        .await
+        .with_context(|| format!("load_table({table_str})"))?;
+    let meta = table.metadata();
+
+    println!("━━━  Metadata Version Log: {table_str}  ━━━");
+
+    let log: Vec<_> = meta.metadata_log().iter().collect();
+
+    if log.is_empty() {
+        println!("  (only one metadata version — no prior entries in log)");
+    } else {
+        let mut tbl = Table::new();
+        tbl.load_preset(UTF8_FULL)
+            .set_header(vec!["#", "Timestamp (UTC)", "Metadata File"]);
+        for (i, entry) in log.iter().enumerate() {
+            let ts = chrono::DateTime::from_timestamp_millis(entry.timestamp_ms)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| entry.timestamp_ms.to_string());
+            tbl.add_row(vec![(i + 1).to_string(), ts, entry.metadata_file.clone()]);
+        }
+        println!("{tbl}");
+    }
+
+    // Always show current metadata file location
+    println!(
+        "\n  Current metadata file: {}",
+        table
+            .metadata_location()
+            .unwrap_or("(unavailable — REST catalog may not expose this)")
+    );
+    Ok(())
+}
+
+// ─── files ────────────────────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_files(
+    catalog: &impl Catalog,
+    table_str: &str,
+    all_status: bool,
+    snapshot_id: Option<i64>,
+    show_column_stats: bool,
+    show_bounds: bool,
+) -> Result<()> {
+    let ident = parse_table(table_str)?;
+    let table = catalog
+        .load_table(&ident)
+        .await
+        .with_context(|| format!("load_table({table_str})"))?;
+    let meta = table.metadata();
+    let file_io = table.file_io();
+
+    // Resolve the snapshot to inspect
+    let snap = match snapshot_id {
+        Some(id) => meta
+            .snapshot_by_id(id)
+            .ok_or_else(|| anyhow::anyhow!("Snapshot {id} not found in '{table_str}'"))?,
+        None => match meta.current_snapshot() {
+            Some(s) => s,
+            None => {
+                println!("(no snapshots — table is empty)");
+                return Ok(());
+            }
+        },
+    };
+
+    let manifest_list = snap
+        .load_manifest_list(file_io, &table.metadata_ref())
+        .await
+        .context("load manifest list")?;
+
+    // ── Header row ────────────────────────────────────────────────────────────
+    // Build a comfy-table with the columns matching Spark/Trino's $files view.
+    // Optional stat columns are appended when requested.
+    let mut headers = vec![
+        "content",
+        "file_path",
+        "file_format",
+        "spec_id",
+        "record_count",
+        "file_size_in_bytes",
+        "status",
+    ];
+    if show_column_stats {
+        headers.push("column_sizes");
+        headers.push("value_counts");
+        headers.push("null_value_counts");
+        headers.push("nan_value_counts");
+    }
+    if show_bounds {
+        headers.push("lower_bounds");
+        headers.push("upper_bounds");
+    }
+    headers.push("sort_order_id");
+    headers.push("split_offsets");
+
+    let mut tbl = Table::new();
+    tbl.load_preset(comfy_table::presets::UTF8_FULL)
+        .set_header(headers);
+
+    let mut total_files = 0usize;
+    let mut total_bytes = 0u64;
+    let mut total_records = 0u64;
+
+    for manifest_entry in manifest_list.entries() {
+        // spec_id lives on the ManifestFile (manifest list entry), not the DataFile
+        let spec_id = manifest_entry.partition_spec_id;
+
+        let manifest = manifest_entry
+            .load_manifest(file_io)
+            .await
+            .with_context(|| format!("load manifest {}", manifest_entry.manifest_path))?;
+
+        for entry in manifest.entries() {
+            let status = entry.status();
+
+            // By default show only ADDED (active) files; --all-status shows everything
+            if !all_status && status != ManifestStatus::Added && status != ManifestStatus::Existing
+            {
+                continue;
+            }
+
+            let df = entry.data_file();
+
+            total_files += 1;
+            total_bytes += df.file_size_in_bytes();
+            total_records += df.record_count();
+
+            let content_str = match df.content_type() {
+                DataContentType::Data => "DATA",
+                DataContentType::EqualityDeletes => "EQUALITY_DELETES",
+                DataContentType::PositionDeletes => "POSITION_DELETES",
+            };
+
+            let status_str = match status {
+                ManifestStatus::Existing => "EXISTING",
+                ManifestStatus::Added => "ADDED",
+                ManifestStatus::Deleted => "DELETED",
+            };
+
+            let split_offsets_str = match df.split_offsets() {
+                None | Some(&[]) => "(none)".to_string(),
+                Some(offsets) => format!(
+                    "[{}]",
+                    offsets
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            };
+
+            let sort_order_id_str = df
+                .sort_order_id()
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "—".to_string());
+
+            let mut row: Vec<String> = vec![
+                content_str.to_string(),
+                df.file_path().to_string(),
+                format!("{:?}", df.file_format()),
+                spec_id.to_string(),
+                df.record_count().to_string(),
+                df.file_size_in_bytes().to_string(),
+                status_str.to_string(),
+            ];
+
+            if show_column_stats {
+                row.push(format_map_i32_u64(df.column_sizes()));
+                row.push(format_map_i32_u64(df.value_counts()));
+                row.push(format_map_i32_u64(df.null_value_counts()));
+                row.push(format_map_i32_u64(df.nan_value_counts()));
+            }
+
+            if show_bounds {
+                row.push(format_bounds_map(df.lower_bounds()));
+                row.push(format_bounds_map(df.upper_bounds()));
+            }
+
+            row.push(sort_order_id_str);
+            row.push(split_offsets_str);
+
+            tbl.add_row(row);
+        }
+    }
+
+    println!("{tbl}");
+    println!(
+        "\n  {} file(s)  |  {} record(s)  |  {} bytes total",
+        total_files, total_records, total_bytes
+    );
+    Ok(())
+}
+
+// ── formatting helpers ────────────────────────────────────────────────────────
+
+fn format_map_i32_u64(map: &HashMap<i32, u64>) -> String {
+    if map.is_empty() {
+        return "{}".to_string();
+    }
+    let mut pairs: Vec<_> = map.iter().collect();
+    pairs.sort_by_key(|(k, _)| *k);
+    let inner: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}:{v}")).collect();
+    format!("{{{}}}", inner.join(", "))
+}
+
+fn format_bounds_map(map: &HashMap<i32, Datum>) -> String {
+    if map.is_empty() {
+        return "{}".to_string();
+    }
+    let mut pairs: Vec<_> = map.iter().collect();
+    pairs.sort_by_key(|(k, _)| *k);
+    let inner: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}:{:?}", v)).collect();
+    format!("{{{}}}", inner.join(", "))
 }
