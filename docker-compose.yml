@@ -32,7 +32,7 @@ services:
 
   # ── Iceberg REST catalog ──────────────────────────────────────────────────────
   rest:
-    image: apache/iceberg-rest-fixture
+    image: tabulario/iceberg-rest
     container_name: iceberg-rest
     networks:
       iceberg_net:
@@ -206,20 +206,16 @@ services:
       - |
         echo "==> Running Iceberg MERGE demo via spark-sql..."
         /opt/spark/bin/spark-sql \
+          --conf spark.sql.defaultCatalog=iceberg \
           --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
-          --conf spark.sql.catalog.core=org.apache.iceberg.spark.SparkCatalog \
-          --conf spark.sql.catalog.core.type=rest \
-          --conf spark.sql.catalog.core.uri=http://rest:8181 \
-          --conf spark.sql.catalog.core.io-impl=org.apache.iceberg.aws.s3.S3FileIO \
-          --conf spark.sql.catalog.core.default-namespace=core \
-          --conf spark.sql.catalog.core.s3.endpoint=http://minio:9000 \
-          --conf spark.sql.catalog.core.warehouse=s3a://warehouse/ \
+          --conf spark.sql.catalog.iceberg=org.apache.iceberg.spark.SparkCatalog \
+          --conf spark.sql.catalog.iceberg.type=rest \
+          --conf spark.sql.catalog.iceberg.uri=http://rest:8181 \
+          --conf spark.sql.catalog.iceberg.io-impl=org.apache.iceberg.aws.s3.S3FileIO \
+          --conf spark.sql.catalog.iceberg.warehouse=s3a://warehouse/ \
+          --conf spark.sql.catalog.iceberg.s3.endpoint=http://minio:9000 \
+          --conf spark.sql.catalog.iceberg.s3.path-style-access=true \
           --conf spark.sql.catalog.spark_catalog=org.apache.iceberg.spark.SparkSessionCatalog \
-          --conf spark.sql.catalog.spark_catalog.type=hive \
-          --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
-          --conf spark.hadoop.fs.s3a.access.key=admin \
-          --conf spark.hadoop.fs.s3a.secret.key=password \
-          --conf spark.hadoop.fs.s3a.path.style.access=true \
           -f /home/iceberg/demo.sql
         echo "==> Demo complete."
     restart: "no"
