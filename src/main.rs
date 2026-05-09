@@ -2413,6 +2413,16 @@ async fn cmd_metadata_log(catalog: &impl Catalog, table_str: &str) -> Result<()>
 
 // ─── files ────────────────────────────────────────────────────────────────────
 
+// ─── files ────────────────────────────────────────────────────────────────────
+//
+// Replicates Spark/Trino's  SELECT * FROM <table>$files
+// Columns (in order):
+//   content, file_path, file_format, spec_id, record_count,
+//   file_size_in_bytes, column_sizes, value_counts, null_value_counts,
+//   nan_value_counts, lower_bounds, upper_bounds,
+//   key_metadata, split_offsets, equality_ids, sort_order_id,
+//   readable_metrics
+
 #[allow(clippy::too_many_arguments)]
 async fn cmd_files(
     catalog: &impl Catalog,
@@ -2429,8 +2439,17 @@ async fn cmd_files(
         .with_context(|| format!("load_table({table_str})"))?;
     let meta = table.metadata();
     let file_io = table.file_io();
+    let schema = meta.current_schema();
 
-    // Resolve the snapshot to inspect
+    // Build a field-id → name lookup for readable_metrics
+    let id_to_name: HashMap<i32, String> = schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|f| (f.id, f.name.clone()))
+        .collect();
+
+    // Resolve snapshot
     let snap = match snapshot_id {
         Some(id) => meta
             .snapshot_by_id(id)
@@ -2449,30 +2468,33 @@ async fn cmd_files(
         .await
         .context("load manifest list")?;
 
-    // ── Header row ────────────────────────────────────────────────────────────
-    // Build a comfy-table with the columns matching Spark/Trino's $files view.
-    // Optional stat columns are appended when requested.
-    let mut headers = vec![
+    // ── Build header ──────────────────────────────────────────────────────────
+    let mut headers: Vec<&str> = vec![
         "content",
         "file_path",
         "file_format",
         "spec_id",
         "record_count",
         "file_size_in_bytes",
-        "status",
     ];
     if show_column_stats {
-        headers.push("column_sizes");
-        headers.push("value_counts");
-        headers.push("null_value_counts");
-        headers.push("nan_value_counts");
+        headers.extend_from_slice(&[
+            "column_sizes",
+            "value_counts",
+            "null_value_counts",
+            "nan_value_counts",
+        ]);
     }
     if show_bounds {
-        headers.push("lower_bounds");
-        headers.push("upper_bounds");
+        headers.extend_from_slice(&["lower_bounds", "upper_bounds"]);
     }
-    headers.push("sort_order_id");
-    headers.push("split_offsets");
+    headers.extend_from_slice(&[
+        "key_metadata",
+        "split_offsets",
+        "equality_ids",
+        "sort_order_id",
+        "readable_metrics",
+    ]);
 
     let mut tbl = Table::new();
     tbl.load_preset(comfy_table::presets::UTF8_FULL)
@@ -2482,19 +2504,17 @@ async fn cmd_files(
     let mut total_bytes = 0u64;
     let mut total_records = 0u64;
 
-    for manifest_entry in manifest_list.entries() {
-        // spec_id lives on the ManifestFile (manifest list entry), not the DataFile
-        let spec_id = manifest_entry.partition_spec_id;
+    for mf in manifest_list.entries() {
+        let spec_id = mf.partition_spec_id;
 
-        let manifest = manifest_entry
+        let manifest = mf
             .load_manifest(file_io)
             .await
-            .with_context(|| format!("load manifest {}", manifest_entry.manifest_path))?;
+            .with_context(|| format!("load manifest {}", mf.manifest_path))?;
 
         for entry in manifest.entries() {
             let status = entry.status();
 
-            // By default show only ADDED (active) files; --all-status shows everything
             if !all_status && status != ManifestStatus::Added && status != ManifestStatus::Existing
             {
                 continue;
@@ -2506,20 +2526,47 @@ async fn cmd_files(
             total_bytes += df.file_size_in_bytes();
             total_records += df.record_count();
 
+            // ── fixed columns ────────────────────────────────────────────────
             let content_str = match df.content_type() {
-                DataContentType::Data => "DATA",
-                DataContentType::EqualityDeletes => "EQUALITY_DELETES",
-                DataContentType::PositionDeletes => "POSITION_DELETES",
+                DataContentType::Data => "0",
+                DataContentType::EqualityDeletes => "2",
+                DataContentType::PositionDeletes => "1",
             };
 
-            let status_str = match status {
-                ManifestStatus::Existing => "EXISTING",
-                ManifestStatus::Added => "ADDED",
-                ManifestStatus::Deleted => "DELETED",
+            let format_str = format!("{:?}", df.file_format());
+
+            let mut row: Vec<String> = vec![
+                content_str.to_string(),
+                df.file_path().to_string(),
+                format_str,
+                spec_id.to_string(),
+                df.record_count().to_string(),
+                df.file_size_in_bytes().to_string(),
+            ];
+
+            // ── optional stat columns ────────────────────────────────────────
+            if show_column_stats {
+                row.push(fmt_map_u64(df.column_sizes()));
+                row.push(fmt_map_u64(df.value_counts()));
+                row.push(fmt_map_u64(df.null_value_counts()));
+                row.push(fmt_map_u64(df.nan_value_counts()));
+            }
+
+            if show_bounds {
+                row.push(fmt_bounds(df.lower_bounds()));
+                row.push(fmt_bounds(df.upper_bounds()));
+            }
+
+            // ── trailing columns ─────────────────────────────────────────────
+            // key_metadata
+            let key_meta = match df.key_metadata() {
+                None | Some(&[]) => "NULL".to_string(),
+                Some(b) => format!("<{} bytes>", b.len()),
             };
 
+            // split_offsets
             let split_offsets_str = match df.split_offsets() {
-                None | Some(&[]) => "(none)".to_string(),
+                None | Some(&[]) => "NULL".to_string(),
                 Some(offsets) => format!(
                     "[{}]",
                     offsets
@@ -2530,35 +2577,34 @@ async fn cmd_files(
                 ),
             };
 
+            // equality_ids
+            let equality_ids_str = match df.equality_ids() {
+                None => "NULL".to_string(),
+                Some(ids) if ids.is_empty() => "NULL".to_string(),
+                Some(ids) => format!(
+                    "[{}]",
+                    ids.iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            };
+
+            // sort_order_id
             let sort_order_id_str = df
                 .sort_order_id()
                 .map(|id| id.to_string())
-                .unwrap_or_else(|| "—".to_string());
+                .unwrap_or_else(|| "NULL".to_string());
 
-            let mut row: Vec<String> = vec![
-                content_str.to_string(),
-                df.file_path().to_string(),
-                format!("{:?}", df.file_format()),
-                spec_id.to_string(),
-                df.record_count().to_string(),
-                df.file_size_in_bytes().to_string(),
-                status_str.to_string(),
-            ];
+            // readable_metrics — per-column {name: {col_size, value_count,
+            // null_value_count, nan_value_count, lower_bound, upper_bound}}
+            let readable = build_readable_metrics(df, &id_to_name);
 
-            if show_column_stats {
-                row.push(format_map_i32_u64(df.column_sizes()));
-                row.push(format_map_i32_u64(df.value_counts()));
-                row.push(format_map_i32_u64(df.null_value_counts()));
-                row.push(format_map_i32_u64(df.nan_value_counts()));
-            }
-
-            if show_bounds {
-                row.push(format_bounds_map(df.lower_bounds()));
-                row.push(format_bounds_map(df.upper_bounds()));
-            }
-
-            row.push(sort_order_id_str);
+            row.push(key_meta);
             row.push(split_offsets_str);
+            row.push(equality_ids_str);
+            row.push(sort_order_id_str);
+            row.push(readable);
 
             tbl.add_row(row);
         }
@@ -2572,24 +2618,66 @@ async fn cmd_files(
     Ok(())
 }
 
-// ── formatting helpers ────────────────────────────────────────────────────────
+// ── helpers ───────────────────────────────────────────────────────────────────
 
-fn format_map_i32_u64(map: &HashMap<i32, u64>) -> String {
+/// Format a &HashMap<i32, u64> as `{id=value, ...}` (Spark-style).
+fn fmt_map_u64(map: &HashMap<i32, u64>) -> String {
     if map.is_empty() {
         return "{}".to_string();
     }
     let mut pairs: Vec<_> = map.iter().collect();
     pairs.sort_by_key(|(k, _)| *k);
-    let inner: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}:{v}")).collect();
+    let inner: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
     format!("{{{}}}", inner.join(", "))
 }
 
-fn format_bounds_map(map: &HashMap<i32, Datum>) -> String {
+/// Format a &HashMap<i32, Datum> as `{id=value, ...}`.
+fn fmt_bounds(map: &HashMap<i32, Datum>) -> String {
     if map.is_empty() {
         return "{}".to_string();
     }
     let mut pairs: Vec<_> = map.iter().collect();
     pairs.sort_by_key(|(k, _)| *k);
-    let inner: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}:{:?}", v)).collect();
+    let inner: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={v:?}")).collect();
     format!("{{{}}}", inner.join(", "))
+}
+
+/// Build the readable_metrics string:
+/// {col_name={col_size=N, value_count=N, null_value_count=N,
+///            nan_value_count=N, lower_bound=X, upper_bound=X}, ...}
+fn build_readable_metrics(
+    df: &iceberg::spec::DataFile,
+    id_to_name: &HashMap<i32, String>,
+) -> String {
+    // Collect all field IDs that appear in any of the maps
+    let mut field_ids: Vec<i32> = {
+        let mut ids = std::collections::BTreeSet::new();
+        for k in df.column_sizes().keys() {
+            ids.insert(*k);
+        }
+        for k in df.value_counts().keys() {
+            ids.insert(*k);
+        }
+        ids.into_iter().collect()
+    };
+    field_ids.sort();
+
+    if field_ids.is_empty() {
+        return "{}".to_string();
+    }
+
+    let parts: Vec<String> = field_ids.iter().map(|id| {
+        let name = id_to_name.get(id).map(|s| s.as_str()).unwrap_or("?");
+        let col_size     = df.column_sizes().get(id).map(|v| v.to_string()).unwrap_or_else(|| "NULL".to_string());
+        let value_count  = df.value_counts().get(id).map(|v| v.to_string()).unwrap_or_else(|| "NULL".to_string());
+        let null_count   = df.null_value_counts().get(id).map(|v| v.to_string()).unwrap_or_else(|| "NULL".to_string());
+        let nan_count    = df.nan_value_counts().get(id).map(|v| v.to_string()).unwrap_or_else(|| "NULL".to_string());
+        let lower        = df.lower_bounds().get(id).map(|v| format!("{v:?}")).unwrap_or_else(|| "NULL".to_string());
+        let upper        = df.upper_bounds().get(id).map(|v| format!("{v:?}")).unwrap_or_else(|| "NULL".to_string());
+        format!(
+            "{name}={{col_size={col_size}, value_count={value_count}, null_value_count={null_count}, nan_value_count={nan_count}, lower_bound={lower}, upper_bound={upper}}}"
+        )
+    }).collect();
+
+    format!("{{{}}}", parts.join(", "))
 }
